@@ -1,0 +1,212 @@
+#!/bin/bash
+
+show_help() {
+  cat << EOF
+Usage:
+ free [options]
+
+Options:
+ -b, --bytes         show output in bytes
+ -k, --kilo          show output in kibibytes (default)
+ -m, --mega          show output in mebibytes
+ -g, --giga          show output in gibibytes
+ -t, --total         show total for RAM
+ -h, --human         show human-readable output
+ -s N, --seconds N   repeat every N seconds
+ -c N, --count N     repeat N times then exit
+ -w, --wide          wide output
+ -l, --lohi          show high/low memory stats (no-op on macOS)
+ -V, --version       display version
+     --si            use powers of 1000 not 1024
+ -v                  verbose (alias for -h)
+
+EOF
+}
+
+UNIT="kb"
+HUMAN=0
+TOTAL=0
+WIDE=0
+SI=0
+SECONDS=0
+COUNT=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -b|--bytes) UNIT="b" ;;
+    -k|--kilo) UNIT="kb" ;;
+    -m|--mega) UNIT="mb" ;;
+    -g|--giga) UNIT="gb" ;;
+    -h|--human) HUMAN=1 ;;
+    -v) HUMAN=1 ;;
+    -t|--total) TOTAL=1 ;;
+    -w|--wide) WIDE=1 ;;
+    -l|--lohi) ;;
+    --si) SI=1 ;;
+    -s|--seconds) shift; SECONDS="$1" ;;
+    -c|--count) shift; COUNT="$1" ;;
+    --help) show_help; exit 0 ;;
+    -V|--version) echo "meow meow meow mrrp >.< free on macos cuz i was pissed off"; exit 0 ;;
+    *) echo "free: invalid option -- '$1'"; echo "Try 'free --help' for more info."; exit 1 ;;
+  esac
+  shift
+done
+
+get_stats() {
+  local pagesize
+  pagesize=$(vm_stat | grep -o 'page size of [0-9]*' | awk '{print $4}')
+  [[ -z "$pagesize" ]] && pagesize=4096
+
+  local free_p active_p inactive_p wired_p compressed_p speculative_p
+  free_p=$(vm_stat | awk '/Pages free:/ {gsub("\\.",""); print $3+0}')
+  active_p=$(vm_stat | awk '/Pages active:/ {gsub("\\.",""); print $3+0}')
+  inactive_p=$(vm_stat | awk '/Pages inactive:/ {gsub("\\.",""); print $3+0}')
+  wired_p=$(vm_stat | awk '/Pages wired down:/ {gsub("\\.",""); print $4+0}')
+  compressed_p=$(vm_stat | awk '/Pages occupied by compressor:/ {gsub("\\.",""); print $5+0}')
+  speculative_p=$(vm_stat | awk '/Pages speculative:/ {gsub("\\.",""); print $3+0}')
+
+  compressed_p=${compressed_p:-0}
+  speculative_p=${speculative_p:-0}
+
+  MEM_TOTAL_B=$(( (free_p + active_p + inactive_p + wired_p + compressed_p) * pagesize ))
+  MEM_USED_B=$(( (active_p + wired_p + compressed_p) * pagesize ))
+  MEM_FREE_B=$(( free_p * pagesize ))
+  MEM_SHARED_B=$(( speculative_p * pagesize ))
+  MEM_CACHE_B=$(( inactive_p * pagesize ))
+  MEM_AVAIL_B=$(( (free_p + inactive_p + speculative_p) * pagesize ))
+
+  SWAP_TOTAL_B=0; SWAP_USED_B=0; SWAP_FREE_B=0
+  local swapinfo
+  swapinfo=$(sysctl -n vm.swapusage 2>/dev/null)
+  if [[ -n "$swapinfo" ]]; then
+    local stotal sused sfree
+    stotal=$(echo "$swapinfo" | awk '{print $3}' | tr -d 'M')
+    sused=$(echo "$swapinfo" | awk '{print $6}' | tr -d 'M')
+    sfree=$(echo "$swapinfo" | awk '{print $9}' | tr -d 'M')
+    SWAP_TOTAL_B=$(echo "$stotal * 1048576 / 1" | bc 2>/dev/null || echo 0)
+    SWAP_USED_B=$(echo "$sused * 1048576 / 1" | bc 2>/dev/null || echo 0)
+    SWAP_FREE_B=$(echo "$sfree * 1048576 / 1" | bc 2>/dev/null || echo 0)
+  fi
+}
+
+divisor() {
+  if [[ $SI -eq 1 ]]; then
+    case "$UNIT" in
+      b)  echo 1 ;;
+      kb) echo 1000 ;;
+      mb) echo 1000000 ;;
+      gb) echo 1000000000 ;;
+    esac
+  else
+    case "$UNIT" in
+      b)  echo 1 ;;
+      kb) echo 1024 ;;
+      mb) echo 1048576 ;;
+      gb) echo 1073741824 ;;
+    esac
+  fi
+}
+
+unit_label() {
+  if [[ $SI -eq 1 ]]; then
+    case "$UNIT" in b) echo "B" ;; kb) echo "kB" ;; mb) echo "MB" ;; gb) echo "GB" ;; esac
+  else
+    case "$UNIT" in b) echo "B" ;; kb) echo "KiB" ;; mb) echo "MiB" ;; gb) echo "GiB" ;; esac
+  fi
+}
+
+convert() {
+  local val=$1
+  local div
+  div=$(divisor)
+  echo $(( val / div ))
+}
+
+human_fmt() {
+  local val=$1
+  local base=1024
+  [[ $SI -eq 1 ]] && base=1000
+
+  if (( val >= base * base * base )); then
+    printf "%.1fG" "$(echo "scale=1; $val / ($base * $base * $base)" | bc)"
+  elif (( val >= base * base )); then
+    printf "%.1fM" "$(echo "scale=1; $val / ($base * $base)" | bc)"
+  elif (( val >= base )); then
+    printf "%.1fK" "$(echo "scale=1; $val / $base" | bc)"
+  else
+    printf "%dB" "$val"
+  fi
+}
+
+fmt() {
+  if [[ $HUMAN -eq 1 ]]; then
+    human_fmt "$1"
+  else
+    convert "$1"
+  fi
+}
+
+print_output() {
+  get_stats
+
+  local lbl
+  lbl=$(unit_label)
+
+  if [[ $HUMAN -eq 1 ]]; then
+    lbl=""
+  fi
+
+  if [[ $WIDE -eq 1 ]]; then
+    printf "%s\n" "               total        used        free      shared     buffers       cache   available"
+    printf "%-7s %11s %11s %11s %11s %11s %11s %11s\n" \
+      "Mem:" \
+      "$(fmt $MEM_TOTAL_B)" \
+      "$(fmt $MEM_USED_B)" \
+      "$(fmt $MEM_FREE_B)" \
+      "$(fmt $MEM_SHARED_B)" \
+      "$(fmt 0)" \
+      "$(fmt $MEM_CACHE_B)" \
+      "$(fmt $MEM_AVAIL_B)"
+  else
+    printf "%s\n" "               total        used        free      shared  buff/cache   available"
+    printf "%-7s %11s %11s %11s %11s %11s %11s\n" \
+      "Mem:" \
+      "$(fmt $MEM_TOTAL_B)" \
+      "$(fmt $MEM_USED_B)" \
+      "$(fmt $MEM_FREE_B)" \
+      "$(fmt $MEM_SHARED_B)" \
+      "$(fmt $MEM_CACHE_B)" \
+      "$(fmt $MEM_AVAIL_B)"
+  fi
+
+  printf "%-7s %11s %11s %11s\n" \
+    "Swap:" \
+    "$(fmt $SWAP_TOTAL_B)" \
+    "$(fmt $SWAP_USED_B)" \
+    "$(fmt $SWAP_FREE_B)"
+
+  if [[ $TOTAL -eq 1 ]]; then
+    local tt tu tf
+    tt=$(( MEM_TOTAL_B + SWAP_TOTAL_B ))
+    tu=$(( MEM_USED_B + SWAP_USED_B ))
+    tf=$(( MEM_FREE_B + SWAP_FREE_B ))
+    printf "%-7s %11s %11s %11s\n" \
+      "Total:" \
+      "$(fmt $tt)" \
+      "$(fmt $tu)" \
+      "$(fmt $tf)"
+  fi
+}
+
+if [[ $SECONDS -gt 0 ]]; then
+  iter=0
+  while true; do
+    print_output
+    iter=$(( iter + 1 ))
+    [[ $COUNT -gt 0 && $iter -ge $COUNT ]] && break
+    sleep "$SECONDS"
+    echo ""
+  done
+else
+  print_output
+fi
